@@ -1,0 +1,251 @@
+#!/usr/bin/perl
+#   $Id: read-growatt,v 1.4 2012/11/06 03:24:14 az Exp $
+#
+#   File:               read-growatt
+#   Date:               Sun Jun  5 15:46:42 2011
+#   Author:             Alexander Zangerl (az)
+# 
+#   Abstract:
+#       read current statistics values from a growatt inverter
+#
+#   License: GPL v1 or v2
+#
+use strict;
+use Data::Dumper;
+use LWP::UserAgent;
+use POSIX qw(strftime);
+use Template;
+
+my $retries=20;			# how often to retry reads
+my $timeout=20;			# how many seconds to wait for responses
+my $delay=2;			# seconds to wait between retries
+
+my ($invaddr,$port,$sysid,$apikey)=@ARGV;
+die "usage: $0 <inverteraddress> </dev/ttyXYZ> [<sysid> <apikey>]\ndata is uploaded to pvoutput.org if sysid and apikey are set.\n" 
+    if (!$invaddr || !-r $port || ($sysid && !$apikey) || (!$sysid && $apikey));
+
+# startup: prep the serial port
+# cheapest to do it via stty; termios from perl sucks
+# note: must disable all the echo stuff!
+die "stty failed: $!\n" if (0xffff & system("stty","-F",$port,qw(9600 raw cs8 -cstopb -parenb -parodd 
+-crtscts -hup -onlcr -echo -echoe -echok -ctlecho)));
+open(F,"+<",$port) or die "can't open device $port: $!\n";
+binmode(F);
+
+# reset all dynaddys, gives me address (and, oddly enough, the whole energy reading!)
+# same for resetting this inverter...
+# my @res=sendrecv(0x3f,0x23,0x7e,0x31,0x44,0);
+
+# what's your serial number and inverter address?
+my ($happy,@res);
+for (1..$retries)
+{
+    @res=sendrecv(0x3f,0x23,0x7e,0x32,0x53,0);
+    if ($res[2] eq $invaddr)
+    {
+	$happy=1;
+	last;
+    }
+    sleep($delay);
+}
+die "no response from inverter $invaddr, giving up.\n" if (!$happy);
+
+
+my %status;
+$happy=0;
+for (1..$retries)
+{
+    %status=(serial=>pack("C*",@res[6..15]), &readinv(0),&readinv(1));
+    # ask for model and fw
+    @res=sendrecv(0x3f,0x23,0x7e,0x32,0x43,0);
+    $status{firmware}=$res[15];	#  spec says nothing about the structure of the fw id
+    $status{model}=sprintf("P%X U%d M%d S%d",($res[13]&0xf0)>>4,($res[13]&0x0f),
+			   ($res[14]&0xf0)>>4,($res[14]&0x0f));
+    # ...which also includes pmax and vdc rating
+    $status{pmax}=(($res[7]<<24)+($res[8]<<16)+($res[9]<<8)+$res[10])/10.0;
+    $status{vdcnormal}=(($res[11]<<8)+$res[12])/10.0;
+
+    $status{stattext}=$status{status}==0?'waiting':$status{status}==1?'normal':'FAULT!';
+
+    # try to guess nonsensical readings: firmware, power rating or grid status blank.
+    if ($status{gridvolt} && $status{gridfreq} && $status{firmware} && $status{pmax})
+    {
+	$happy=1;
+	last;
+    }
+    sleep($delay);
+}
+die "couldn't read inverter status, giving up.\n" if (!$happy);
+close(F);
+
+# now produce output in a somewhat decent format
+my $template='Inverter Status:
+================
+Model: $model Serial: $serial Firmware: $firmware
+Rating max: ${pmax}W Vdc: ${vdcnormal}V
+
+Status: $stattext (Fault type: $faulttype)
+Temperature: ${temp} degC
+
+PV1: ${pvvolt1}V PV2: ${pvvolt2}V
+Input: ${pvpower}W
+
+Grid Voltage: ${gridvolt}V Freq: ${gridfreq}Hz 
+Output: ${gridpower}W ${gridamp}A
+
+Energy Today: ${etoday}kWh
+Energy Total: ${etotal}kWh Time Total: ${hrstotal}hrs
+
+';
+
+my $t=Template->new({INTERPOLATE=>1,EVAL_PERL=>1});
+$t->process(\$template,\%status);
+
+# now upload to pvoutput.org if asked to
+if ($sysid && $apikey)
+{
+    my $updateurl="http://pvoutput.org/service/r2/addstatus.jsp";
+    my $ua=LWP::UserAgent->new(
+	default_headers=>HTTP::Headers->new("X-Pvoutput-Apikey"=>$apikey,
+					    "X-Pvoutput-SystemId"=>$sysid));
+    $ua->env_proxy;
+    my @data=("d"=>strftime("%Y%m%d",localtime),
+	      "t"=>strftime("%H:%M",localtime),
+	      "c1"=>0,
+	      "v1"=>$status{etoday}*1000,
+	      "v2"=>$status{gridpower},
+	      "v5"=>$status{temp},
+	      "v6"=>$status{gridvolt});
+    my $res=$ua->post($updateurl,
+		      \@data);
+    if (!$res->is_success)
+    {
+	die "pvoutput upload failed: ".$res->decoded_content."\n";
+    }
+}
+exit 0;
+
+
+# talks to inverter, returns power or energy readings as hash
+sub readinv
+{
+    my ($wantenergy)=@_;
+    
+    my @cmd=(0x3f,0x23,$invaddr,0x32,($wantenergy?0x42:0x41),0);
+
+    debug("reading ".($wantenergy?"energy\n":"power\n"));
+    my @res=sendrecv(@cmd);
+    my @d=@res[6..($#res-2)];
+   
+    if ($wantenergy)
+    {
+	return (etoday=>(($d[7]<<8)+$d[8])/10.0,
+		etotal=>(($d[9]<<24)+($d[10]<<16)+($d[11]<<8)+$d[12])/10.0,
+		hrstotal=>(($d[13]<<24)+($d[14]<<16)+($d[15]<<8)+$d[16])/10.0);
+    }
+    else
+    {
+	return (status=>$d[0],
+		pvvolt1=>(($d[1]<<8)+$d[2])/10.0,
+		pvvolt2=>(($d[3]<<8)+$d[4])/10.0,
+		pvpower=>(($d[5]<<8)+$d[6])/10.0,
+		gridvolt=>(($d[7]<<8)+$d[8])/10.0,
+		gridamp=>(($d[9]<<8)+$d[10])/10.0,
+		gridfreq=>(($d[11]<<8)+$d[12])/100.0,
+		gridpower=>(($d[13]<<8)+$d[14])/10.0,
+		isofault=>(($d[15]<<8)+$d[16]),
+		gcfifault=>(($d[17]<<8)+$d[18]),
+		dcifault=>(($d[19]<<8)+$d[20]),
+		pvvoltfault=>(($d[21]<<8)+$d[22]),
+		gridvoltfault=>(($d[23]<<8)+$d[24]),
+		gridfreqfault=>(($d[25]<<8)+$d[26]),
+		tempfault=>(($d[27]<<8)+$d[28]),
+		faulttype=>(($d[29]<<8)+$d[30]),
+		temp=>(($d[31]<<8)+$d[32])/10.0);
+    }
+}
+
+# sends command to inverter, returns response
+# input: command list of bytes (pre-checksum)
+# output: response list of bytes - or undef if the read didn't work out
+sub sendrecv
+{
+    my (@cmd)=@_;
+
+    my $cs=checksum(@cmd);
+    debug("cmd out: ".hexdump(@cmd,pack("n",$cs)));
+    my $out=pack("C".@cmd."n",@cmd,$cs);
+    my $wrote=syswrite(F,$out);
+    die "write to device failed, wrote $wrote bytes: $!\n" if ($wrote != @cmd+2);
+    
+    # now try to read a response, but give it a little time before giving up
+    # format: 0x3f, 0x23, addr, c0 c1 dlen d0 .... dl-1 s0 s1
+    my ($read,$response);
+    eval {
+	local $SIG{ALRM} = sub { die "alarm\n" }; # NB: \n required
+	alarm($timeout);
+	$read=sysread(F,$response,6);
+	alarm 0;
+    };
+    die if ($@ and $@ ne "alarm\n");
+    if ($read!=6)
+    {
+	debug("no header reveived, read $read bytes\n");
+	return undef;
+    }
+
+    # now read the rest: optional data and 2 checksum bytes
+    my @header=unpack("C*",$response);
+    if ($header[0] != 0x23 || $header[1] != 0x3f)
+    {
+	debug("header doesn't match response: got ".hexdump(@header));
+	return undef;
+    }
+    debug("received header: ".hexdump(@header));
+    my $toread=2+$header[5];
+    $response="";
+    while ($toread)
+    {
+	my $x;
+	my $read=sysread(F,$x,$toread);
+	die "couldn't read from device (wanted $toread): $!\n" if (!defined $read);
+	$toread-=$read;
+	$response.=$x;
+    }
+    my @result=unpack("C*",$response);
+    debug("received remainder: ".hexdump(@result));    
+    $cs=checksum(@header,@result[0..($#result-2)]);
+    my $msgcs=($result[-2]<<8)+$result[-1];
+    die sprintf("checksum should be %04x but is %04x!\n",$cs,$msgcs)
+	if ($cs != $msgcs);
+    return (@header,@result);
+}
+
+# input: message as list of bytes 
+# output: the checkup 16bit int.
+sub checksum
+{
+    my @tosend=@_;
+    my $sum=0;
+    for my $i (0..$#tosend)
+    {
+	$sum+=$tosend[$i]^$i;
+    }
+    $sum=0xffff if (!$sum or $sum>0xffff);
+    return $sum;
+}
+
+sub hexdump
+{
+    return join(" ", map { sprintf("%02x",$_); } (@_));
+}
+
+    
+sub debug 
+{
+    return if (!$ENV{DEBUG});
+
+    print STDERR @_;
+    print STDERR "\n" if ($_[$#_]!~/\n$/);
+}
+
